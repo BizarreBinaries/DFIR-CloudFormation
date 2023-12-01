@@ -1,0 +1,260 @@
+#Velociraptor Auto Deployment - CloudFormation
+#This CloudFormation template automatically deploys Velociraptor onto an AWS Linux AMI.
+#This is intended top be used as part of the template stack providing end to end deployment of velociraptor and timesketch
+#Author: BizarreBinaries - bizarrebinaries.com
+#
+#
+#Credit to Bryant Cabantac - https://github.com/bcabantac/velocloudformation
+#Credit to Eric Capuano and Whitney Champion - https://github.com/ReconInfoSec/velociraptor-to-timesketch
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+    CloudFormation Stack - Velociraptor - This template stack deployes velociraptor and supporting configurationg including:
+    - EC2 instance (EBS volume, VPC, Private IP, Elastic IP)
+    - IAM policy settings
+    - Route53 configuration
+    - Security Group configuration
+    
+Parameters:
+
+    parameterSSHKeyName:
+        Description: Amazon EC2 Key Pair for Velociraptor instance
+        Type: "AWS::EC2::KeyPair::KeyName"
+
+    parameterVPC:
+        Description: VPC ID to deploy Velociraptor instance to
+        Type: "AWS::EC2::VPC::Id"
+
+    parameterSubnetID:
+        Description: Subnet ID to deploy Velociraptor instance to
+        Type: "AWS::EC2::Subnet::Id"
+
+    parameterInstanceType:
+        Description: Velociraptor EC2 instance types
+        Type: String
+        Default: t2.medium
+        # Additional values - These can be changed - Recommend removing micro, nano for real world deployments
+        AllowedValues:
+            - t2.micro
+            - t2.nano
+            - t2.small
+            - t2.medium
+
+    parameterEBSSize:
+        Description: Velociraptor EC2 EBS Volume Size
+        Type: Number
+        Default: 60 # Change depending on size of environment
+        
+    parameterLatestAmiId:
+        Type : "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+        Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+Resources:
+
+    resourceVRIAMUser:
+        Type: AWS::IAM::User
+        Properties:
+            Path: / #optional path value, can use this to reference the creds in bulk
+            UserName: !Ref AWS::StackName
+
+    resourceVRIAMUserCredentials:
+        Type: AWS::IAM::AccessKey
+        Properties:
+            Status: Active
+            UserName: !Ref resourceVRIAMUser
+
+    resourceVRCredentialsStored:
+        Type: AWS::SecretsManager::Secret
+        Properties:
+            Name: !Sub /velociraptor/credentials/${resourceVRIAMUser}
+            SecretString: !Sub '{"ACCESS_KEY":"${resourceVRIAMUserCredentials}","SECRET_KEY":"${resourceVRIAMUserCredentials.SecretAccessKey}"}'
+
+    resourceVRIAMUserRole:
+        Type: "AWS::IAM::Role"
+        Properties:
+            RoleName: 'resourceVRIAMUserRole'
+            Path: "/"
+            
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                - Effect: Allow
+                  Principal: 
+                    AWS: !Sub 'arn:aws:iam::<Account ID>:user/${AWS::StackName}'
+                  Action: sts:AssumeRole 
+        DependsOn:
+           - resourceVRIAMUser 
+           
+    resourceVRIAMUserRolePolicy:
+        Type: "AWS::IAM::ManagedPolicy"
+        Properties:
+            ManagedPolicyName: 'resourceVRIAMUserRolePolicy'
+            Roles:
+                - Ref: "resourceVRIAMUserRole"
+            PolicyDocument:
+                Version: "2012-10-17"
+                Statement:       
+                - Effect: Allow
+                  Action:
+                  - s3:Get*
+                  - s3:Put*
+                  - s3:List*       
+                  Resource:
+                  - "*"
+        DependsOn:
+          - resourceVRIAMUser
+
+    resourceVRS3BucketsRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                - Effect: Allow
+                  Principal: 
+                    Service:
+                    - ec2.amazonaws.com
+                  Action:
+                    - sts:AssumeRole
+            Path: "/"
+
+    resourceVRS3BucketsInstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Path: "/"
+            Roles:
+            - Ref: resourceVRS3BucketsRole
+    
+    resourceVRS3BucketsPolicy:
+        Type: "AWS::IAM::Policy"
+        Properties:
+          PolicyName: resourceVRS3BucketsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Action: s3:GetObject #Important! Restrict to your bucket here.
+                Effect: Allow
+                Resource: "*"
+
+              -
+                Action: s3:ListBucket #Important! Restrict to your bucket here.
+                Effect: Allow
+                Resource: "*"
+          Roles:
+                - !Ref resourceVRS3BucketsRole
+
+    resourcePublicAccessSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            VpcId: !Ref parameterVPC
+            GroupDescription: Allows SSH, HTTP, and HTTPS access to Velociraptor instance
+            GroupName: !Sub '${AWS::StackName}-velociraptor-ssh-access'
+            SecurityGroupIngress:
+                -
+                    CidrIp: '0.0.0.0/0'
+                    Description: 'Replace this rule on more strict one' # Change and acess via clientVPN - Left for lab purposes
+                    FromPort: 22
+                    ToPort: 22
+                    IpProtocol: tcp        
+                -
+                    CidrIp: '0.0.0.0/0'
+                    Description: 'HTTPS web GUI' # recommend lock down to specific IP list
+                    FromPort: 443
+                    ToPort: 443
+                    IpProtocol: tcp    
+                -
+                    CidrIp: '0.0.0.0/0'
+                    Description: 'Agent Front End' # Restrict to public address of agent deployment environment
+                    FromPort: 80
+                    ToPort: 80
+                    IpProtocol: tcp                        
+            Tags:
+                -
+                    Key: Name
+                    Value: !Sub '${AWS::StackName}-velociraptor-ssh-access'
+                    
+    resourceNewVolume:
+        Type: AWS::EC2::Volume
+        Properties:
+            Size: !Ref parameterEBSSize
+            AvailabilityZone: '<Region Here>'
+            Tags:
+                - Key: MyTag
+                  Value: !Sub '${AWS::StackName}-velociraptor-ebs-volume'
+
+    resourceVelociraptor:
+        Type: AWS::EC2::Instance
+        Properties:
+            # Amazon Linux 2 AMI ap-souteast-2
+            IamInstanceProfile: !Ref resourceVRS3BucketsInstanceProfile
+            ImageId: !Ref parameterLatestAmiId #default Linux AMI - update as necessary
+            KeyName: !Sub '${parameterSSHKeyName}'
+            InstanceType: !Sub '${parameterInstanceType}'
+            UserData:
+                Fn::Base64:
+                    Fn::Join: [ "", [
+                        "#!/bin/bash -xe",
+                        "\n",
+                        "sudo sleep 60",
+                        "\n",
+                        "sudo mkfs -t xfs /dev/xvdf",
+                        "\n",
+                        "sudo mkdir /data",
+                        "\n",
+                        "sudo mount /dev/xvdf /data",
+                        "\n",
+                        "sudo mkdir /data/velociraptor",
+                        "\n",
+                        "sudo aws s3 cp s3://s3-velociraptor-prod/vr-server-config/server.config.yaml /data/velociraptor/",
+                        "\n",
+                        "sudo wget https://github.com/Velocidex/velociraptor/releases/download/v0.7.0/velociraptor-v0.7.0-4-linux-amd64 -P /data/velociraptor/",
+                        "\n",
+                        "sudo sleep 60",
+                        "\n",
+                        "sudo chmod +x /data/velociraptor/velociraptor-v0.7.0-4-linux-amd64",
+                        "\n",
+                        "sudo aws s3 cp s3://s3-velociraptor-prod/velociraptor.service /lib/systemd/system/",
+                        "\n",
+                        "sudo systemctl daemon-reload",
+                        "\n",
+                        "sudo systemctl enable --now velociraptor",
+                        "\n",
+                        ]
+                      ]
+                      
+            NetworkInterfaces:
+                -
+                    AssociatePublicIpAddress: true
+                    DeviceIndex: "0"
+                    GroupSet:
+                        - !Ref resourcePublicAccessSecurityGroup
+                    SubnetId: !Ref parameterSubnetID
+            Tags:
+                -
+                    Key: Name
+                    Value: !Sub '${AWS::StackName}-velociraptor'
+                    
+            Volumes:
+                -
+                    Device: "/dev/sdf"
+                    VolumeId: !Ref resourceNewVolume
+  
+    resourceSubdomainDNSRecord:
+        Type: 'AWS::Route53::RecordSet'
+        Properties:
+            HostedZoneId: <Hosted Zone ID Here> # Hosted Zone ID of your indended domain
+            Name: <Subdomain Name Here> #Uses a set subdomain (matches velociraptor generated server config file)
+            ResourceRecords:
+                - !GetAtt 
+                    - resourceVelociraptor
+                    - PublicIp
+            TTL: '300'
+            Type: "A"
+
+Outputs:
+
+    VelociraptorPublicHostname:
+        Description: Velociraptor public hostname
+        Value: !GetAtt resourceVelociraptor.PublicDnsName

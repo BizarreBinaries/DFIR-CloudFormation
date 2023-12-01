@@ -1,0 +1,224 @@
+#TimeSketch Auto Deployment - CloudFormation
+#This CloudFormation template automatically deploys TimeSketch onto a AWS 20.04 Unbunt AMI.
+#This is intended top be used as part of the template stack providing end to end deployment of velociraptor and timesketch
+#Author: BizarreBinaries - bizarrebinaries.com
+#
+#
+#Credit to Bryant Cabantac - https://github.com/bcabantac/velocloudformation
+#Credit to Eric Capuano and Whitney Champion - https://github.com/ReconInfoSec/velociraptor-to-timesketch
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+    CloudFormation Stack - TimeSketch - This template stack deployes TimeSketch and supporting configurationg including:
+    - EC2 instance (EBS volume, VPC, Private IP, Elastic IP)
+    - IAM policy settings
+    - Route53 configuration
+    - Security Group configuration
+
+Parameters:
+
+    parameterSSHKeyName:
+        Description: Amazon EC2 Key Pair for TimeSketch instance
+        Type: "AWS::EC2::KeyPair::KeyName"
+
+    parameterVpcID:
+        Description: VPC ID to deploy TimeSketch instance to
+        Type: "AWS::EC2::VPC::Id"
+
+    parameterSubnetID:
+        Description: Subnet ID to deploy TimeSketch instance to
+        Type: "AWS::EC2::Subnet::Id"
+
+    parameterInstanceType:
+        Description: TimeSketch EC2 instance types
+        Type: String
+        Default: t2.large
+        AllowedValues:
+            - t2.large
+            - t2.2xlarge
+
+    parameterEBSSize:
+        Description: TimeSketch EC2 EBS Volume Size
+        Type: Number
+        Default: 500 # Change depending on size of environment
+        
+    parameterTimeSketchDomain:
+        Type: String
+        Description: Enter the subdomain name for the stack you want mapped to the TimeSketch Instance
+        Default: "ts"
+ 
+Resources:
+
+    resourceTimeSketchS3BucketsRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                - Effect: Allow
+                  Principal: 
+                    Service:
+                    - ec2.amazonaws.com
+                  Action:
+                    - sts:AssumeRole
+            Path: "/"
+
+    resourceTimeSketchS3BucketsInstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Path: "/"
+            Roles:
+            - Ref: resourceTimeSketchS3BucketsRole
+            
+    
+    resourceTimeSketchS3BucketsPolicy:
+        Type: "AWS::IAM::Policy"
+        Properties:
+          PolicyName: TimeSketchS3BucketsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Action: s3:GetObject
+                Effect: Allow
+                Resource: "*" #Important! Restrict to your bucket here.
+
+              -
+                Action: s3:ListBucket
+                Effect: Allow
+                Resource: "*" #Important! Restrict to your bucket here.
+                
+              -
+                Action: s3:PutObject
+                Effect: Allow
+                Resource: "*" #Important! Restrict to your bucket here.               
+          Roles:
+                - !Ref resourceTimeSketchS3BucketsRole
+
+    resourcePublicAccessSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            VpcId: !Ref parameterVpcID
+            GroupDescription: Allows SSH, HTTP, and HTTPS access to TimeSketch instance
+            GroupName: !Sub '${AWS::StackName}-timesketch-ssh-access'
+            SecurityGroupIngress:
+                -
+                    CidrIp: '0.0.0.0/0'
+                    Description: 'Replace to allow for temp management' # Change and acess via clientVPN - Left for lab purposes
+                    FromPort: 22
+                    ToPort: 22
+                    IpProtocol: tcp        
+                -
+                    CidrIp: '0.0.0.0/0'
+                    Description: 'HTTPS web GUI' #Only works if TLS has been setup
+                    FromPort: 443
+                    ToPort: 443
+                    IpProtocol: tcp    
+                -
+                    CidrIp: '0.0.0.0/0'
+                    Description: 'HTTP web GUI' #Not Recommended, Recommmended to setup TLS with LetsEncrypt
+                    FromPort: 80
+                    ToPort: 80
+                    IpProtocol: tcp                        
+            Tags:
+                -
+                    Key: Name
+                    Value: !Sub '${AWS::StackName}-timesketch-ssh-access'
+                    
+    resourceNewVolume:
+        Type: AWS::EC2::Volume
+        Properties:
+            Size: !Ref parameterEBSSize
+            AvailabilityZone: '<Region Here>'
+            Tags:
+                - Key: Name
+                  Value: !Sub '${AWS::StackName}-timesketch-ebs-volume'
+
+    resourceTimeSketch:
+        Type: AWS::EC2::Instance
+        Properties:
+            AvailabilityZone: 'ap-southeast-2a'
+            PrivateDnsNameOptions:
+                HostnameType: resource-name
+            IamInstanceProfile: !Ref resourceTimeSketchS3BucketsInstanceProfile
+            ImageId: ami-0df4b2961410d4cff #default Ubuntu AMI - update if required
+            KeyName: !Sub '${parameterSSHKeyName}'
+            InstanceType: !Sub '${parameterInstanceType}'
+            UserData:
+                Fn::Base64:
+                    Fn::Join: [ "", [
+                        "#!/bin/bash -xe",
+                        "\n",
+                        "sudo sleep 60",
+                        "\n",
+                        "sudo mkfs -t xfs /dev/xvdf",
+                        "\n",
+                        "sudo mkdir /data",
+                        "\n",
+                        "sudo mount /dev/xvdf /data",
+                        "\n",
+                        "sudo mkdir /data",
+                        "\n",
+                        "cd /data",
+                        "\n",
+                        "sudo apt-get update -y",
+                        "\n",
+                        "sudo apt-get install ca-certificates curl gnupg -y",
+                        "\n",                        
+                        "sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg",
+                        "\n",
+                        "sudo chmod a+r /etc/apt/keyrings/docker.gpg",
+                        "\n",
+                        'sudo echo "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null',
+                        "\n",
+                        "sudo apt-get update -y",
+                        "\n",
+                        "sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y",
+                        "\n",
+                        "sudo sudo wget https://raw.githubusercontent.com/google/timesketch/master/contrib/deploy_timesketch.sh -P /data",
+                        "\n",
+                        "sudo chmod 755 /datadeploy_timesketch.sh",
+                        "\n",                        
+                        'sudo echo "no" | sudo /datadeploy_timesketch.sh',
+                        "\n",
+                        "cd /data/timesketch",
+                        "\n",
+                        "sudo docker compose up -d",
+                        ]
+                      ]
+
+            NetworkInterfaces:
+                -
+                    AssociatePublicIpAddress: true
+                    DeviceIndex: "0"
+                    GroupSet:
+                        - !Ref resourcePublicAccessSecurityGroup
+                    SubnetId: !Ref parameterSubnetID
+                    
+            Tags:
+                -
+                    Key: Name
+                    Value: !Sub '${AWS::StackName}-timesketch'
+                    
+            Volumes:
+                -
+                    Device: "/dev/sdf"
+                    VolumeId: !Ref resourceNewVolume
+ 
+    resourceSubdomainDNSRecord:
+        Type: 'AWS::Route53::RecordSet'
+        Properties:
+            HostedZoneId: <Hosted Zone ID Here> # Hosted Zone ID of your indended domain
+            Name: !Join [ ".", [ !Ref parameterTimeSketchDomain, "<Hosted Zone - Domain Here>" ]]
+            ResourceRecords:
+                - !GetAtt 
+                    - resourceTimeSketch
+                    - PublicIp
+            TTL: '300'
+            Type: "A"
+
+Outputs:
+    TimeSketchPublicHostname:
+        Description: TimeSketch public hostname
+        Value: !GetAtt resourceTimeSketch.PublicDnsName
